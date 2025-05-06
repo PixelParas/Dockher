@@ -8,14 +8,26 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <errno.h>
+#include <fstream>
 #include "include/cxxopts.hpp" // For parsing command line options
 
 
 // Size of stack for the child process
 #define STACK_SIZE 1024 * 1024 // 1 MB stack
 
+void write_to_file(const std::string &path, const std::string &value) {
+    std::ofstream file(path);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open: " << path << " — " << strerror(errno) << std::endl;
+        exit(1);
+    }
+    file << value;
+    file.close();
+}
+
 // Child process function: Runs in the new namespace, executes command
 int child_process(void *arg) {
+    // [TODO] Automatically install image if not present
     const std::string rootfs = "./images/ubuntu"; // Path to the root filesystem
 
     // Change the root directory of the container
@@ -39,7 +51,7 @@ int child_process(void *arg) {
 int main(int argc, char *argv[]) {
     try {
         // Create the option parser
-        cxxopts::Options options("minidocker", "Mini Docker in C++");
+        cxxopts::Options options("dockher", "Mini Docker in C++");
 
         // Define the CLI options
         // [TODO] Try to set default values for these
@@ -83,11 +95,31 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        // Wait for the child process to finish
-        waitpid(pid, nullptr, 0);
+    // Only parent reaches here
+    std::string pid_str = std::to_string(pid);
 
-        // Free the allocated stack
-        free(stack);
+    // Unified cgroup v2 directory
+    std::string cgroup_path = "/sys/fs/cgroup/dockher_" + pid_str;
+    mkdir(cgroup_path.c_str(), 0755); // Create cgroup directory
+
+    // Write memory limit (in bytes)
+    write_to_file(cgroup_path + "/memory.max", std::to_string(mem_limit * 1024 * 1024));
+
+    // Write CPU limit: quota and period in microseconds
+    // Example: "50000 100000" = 50ms out of every 100ms => 50% CPU
+    write_to_file(cgroup_path + "/cpu.max", "50000 100000");  // [TODO]: Make this dynamic based on `cpu_limit`
+
+    // Add the child process to the cgroup
+    write_to_file(cgroup_path + "/cgroup.procs", pid_str);
+
+    // Wait for the child process to finish
+    waitpid(pid, nullptr, 0);
+
+    // Cleanup
+    rmdir(cgroup_path.c_str());
+
+    // Free the allocated stack
+    free(stack);
     } 
     /*
               All exceptions derive from "cxxopts::exceptions::exception"
