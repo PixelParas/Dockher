@@ -11,14 +11,9 @@
 #include <fstream>
 #include "include/cxxopts.hpp" // For parsing command line options
 
-#include <pty.h>        // openpty
-#include <utmp.h>       // struct utmp
-#include <termios.h>    // termios
 
 // Size of stack for the child process
 #define STACK_SIZE 1024 * 1024 // 1 MB stack
-int slave_fd; // Declared globally or outside main if needed in child
-
 
 void write_to_file(const std::string &path, const std::string &value) {
     std::ofstream file(path);
@@ -32,60 +27,8 @@ void write_to_file(const std::string &path, const std::string &value) {
 
 // Child process function: Runs in the new namespace, executes command
 int child_process(void *arg) {
-
-    // Set up terminal in the child
-    setsid(); // New session
-    if (ioctl(slave_fd, TIOCSCTTY, 0) == -1) {
-        perror("ioctl TIOCSCTTY");
-        exit(1);
-    }
-
-    dup2(slave_fd, STDIN_FILENO);
-    dup2(slave_fd, STDOUT_FILENO);
-    dup2(slave_fd, STDERR_FILENO);
-    close(slave_fd);
-
     // [TODO] Automatically install image if not present
     const std::string rootfs = "./images/ubuntu"; // Path to the root filesystem
-
-
-    pid_t child = fork();
-    if (child < 0) {
-        perror("fork in child_process");
-        exit(1);
-    }
-
-    if (child == 0) {
-        // In grandchild: This becomes PID 1 in new PID namespace
-        setsid(); // New session leader
-
-        if (ioctl(slave_fd, TIOCSCTTY, 0) == -1) {
-            perror("ioctl TIOCSCTTY");
-            exit(1);
-        }
-
-        dup2(slave_fd, STDIN_FILENO);
-        dup2(slave_fd, STDOUT_FILENO);
-        dup2(slave_fd, STDERR_FILENO);
-        close(slave_fd);
-
-        if (chroot(rootfs.c_str()) == -1) {
-            std::cerr << "chroot failed: " << strerror(errno) << std::endl;
-            exit(1);
-        }
-        chdir("/");
-        setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
-
-        char *const shell[] = { (char*)"sh", NULL };
-        execvp(shell[0], shell);
-        perror("execvp");
-        exit(1);
-    } else {
-        // In child: wait for grandchild
-        int status;
-        waitpid(child, &status, 0);
-        exit(WEXITSTATUS(status));
-    }
 
     // Change the root directory of the container
     if (chroot(rootfs.c_str()) == -1) {
@@ -95,14 +38,12 @@ int child_process(void *arg) {
 
     // Change the working directory to "/"
     chdir("/");
-
-    // Set PATH varibales for the container
+    // Set PATH Variables for the container
     setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games", 1);
-
-
+    
     // Execute the command passed by the user
-    char *const shell[] = { (char*)"sh", NULL };
-    execvp(shell[0], shell);
+    char *const cmd[] = {(char*)"sh", (char*)"-c", (char*)arg, NULL}; // Run the command in a shell
+    execvp(cmd[0], cmd);
 
     // If execvp fails
     std::cerr << "Error in execvp: " << strerror(errno) << std::endl;
@@ -119,7 +60,7 @@ int main(int argc, char *argv[]) {
         options.add_options()
             ("c,cmd", "Command to run inside container", cxxopts::value<std::string>())
             ("m,mem", "Memory limit (MB)", cxxopts::value<int>())
-            ("p,cpu", "CPU limit (%cpu allocation)", cxxopts::value<int>())
+            ("p,cpu", "CPU limit (shares)", cxxopts::value<int>())
             ("h,help", "Print usage");
 
         // Parse the command lines
@@ -140,19 +81,12 @@ int main(int argc, char *argv[]) {
         std::cout << "Parsed values:\n";
         std::cout << "Command to run: " << cmd << std::endl;
         std::cout << "Memory limit: " << mem_limit << " MB" << std::endl;
-        std::cout << "CPU limit: " << cpu_limit << "%" << std::endl;
+        std::cout << "CPU limit: " << cpu_limit << " shares" << std::endl;
 
         // Allocate memory for the child stack
         char *stack = (char *)malloc(STACK_SIZE);
         if (!stack) {
             std::cerr << "Failed to allocate stack for child process" << std::endl;
-            return 1;
-        }
-
-        // Create a pseudo-terminal (PTY) for the child process
-        int master_fd;
-        if (openpty(&master_fd, &slave_fd, NULL, NULL, NULL) == -1) {
-            perror("openpty failed");
             return 1;
         }
 
@@ -163,58 +97,31 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        // Only parent reaches here
-        std::string pid_str = std::to_string(pid);
-        close(slave_fd); // Parent doesn’t use the slave side
+    // Only parent reaches here
+    std::string pid_str = std::to_string(pid);
 
+    // Unified cgroup v2 directory
+    std::string cgroup_path = "/sys/fs/cgroup/dockher_" + pid_str;
+    mkdir(cgroup_path.c_str(), 0755); // Create cgroup directory
 
-        // Unified cgroup v2 directory
-        std::string cgroup_path = "/sys/fs/cgroup/dockher_" + pid_str;
-        mkdir(cgroup_path.c_str(), 0755); // Create cgroup directory
+    // Write memory limit (in bytes)
+    write_to_file(cgroup_path + "/memory.max", std::to_string(mem_limit * 1024 * 1024));
 
-        // Write memory limit (in bytes)
-        write_to_file(cgroup_path + "/memory.max", std::to_string(mem_limit * 1024 * 1024));
+    // Write CPU limit: quota and period in microseconds
+    // Example: "50000 100000" = 50ms out of every 100ms => 50% CPU
+    write_to_file(cgroup_path + "/cpu.max", "50000 100000");  // [TODO]: Make this dynamic based on `cpu_limit`
 
-        // Write CPU limit: quota and period in microseconds
-        // "50000 100000" = 50ms out of every 100ms => 50% CPU
-        int cpu_limit_actual = static_cast<int>((static_cast<double>(cpu_limit)/static_cast<double>(100))*100000);
-        write_to_file(cgroup_path + "/cpu.max", std::to_string(cpu_limit_actual) + " 100000");  // [TODO]: Make this dynamic based on `cpu_limit`
+    // Add the child process to the cgroup
+    write_to_file(cgroup_path + "/cgroup.procs", pid_str);
 
-        // Add the child process to the cgroup
-        write_to_file(cgroup_path + "/cgroup.procs", pid_str);
+    // Wait for the child process to finish
+    waitpid(pid, nullptr, 0);
 
-        // Psudo-terminal setup
-        char buf[1024];
-        while (true) {
-            std::cout << "dockher> ";
-            std::string user_input;
-            std::getline(std::cin, user_input);
+    // Cleanup
+    rmdir(cgroup_path.c_str());
 
-            if (user_input == "dockher_exit") break;
-
-            user_input += "\n";
-            write(master_fd, user_input.c_str(), user_input.size());
-
-            ssize_t n = read(master_fd, buf, sizeof(buf) - 1);
-            if (n > 0) {
-                buf[n] = '\0';
-                std::cout << buf;
-            }
-        }
-
-        // Wait for the child process to finish
-        waitpid(pid, nullptr, 0);
-        close(master_fd);
-
-        // Cleanup
-        // [BUG] Sometimes code does not reach here, eg docker_1270 and dockher_4434
-        // Notebly 4434 was the container with 512% cpu allocation
-        // 1270 seems fine though
-        // might be deu to error in "vmstat" and "ls" 
-        rmdir(cgroup_path.c_str());
-
-        // Free the allocated stack
-        free(stack);
+    // Free the allocated stack
+    free(stack);
     } 
     /*
               All exceptions derive from "cxxopts::exceptions::exception"
