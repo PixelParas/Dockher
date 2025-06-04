@@ -77,6 +77,12 @@ int main(int argc, char *argv[]) {
         int mem_limit = result["mem"].as<int>();    //[TODO] Add support for prefixes so that 1GB = 1024MB
         int cpu_limit = result["cpu"].as<int>();
 
+        //Input Validation
+        if (cpu_limit < 0 || cpu_limit > 100) {
+            std::cerr << "CPU limit must be between 0 and 100 (%)" << std::endl;
+            return 1;
+        }
+
         // Print the parsed values for verification
         std::cout << "Parsed values:\n";
         std::cout << "Command to run: " << cmd << std::endl;
@@ -109,7 +115,12 @@ int main(int argc, char *argv[]) {
 
     // Write CPU limit: quota and period in microseconds
     // Example: "50000 100000" = 50ms out of every 100ms => 50% CPU
-    write_to_file(cgroup_path + "/cpu.max", "50000 100000");  // [TODO]: Make this dynamic based on `cpu_limit`
+    int cpu_period_us = 100000; // 100ms default period
+    int cpu_quota_us = (cpu_limit * cpu_period_us) / 100; // e.g., 50% => 50000
+
+    // If cpu_limit is 0, allow max cpu allocation
+    std::string cpu_max_value = (cpu_limit == 0) ? "max" : std::to_string(cpu_quota_us) + " " + std::to_string(cpu_period_us);
+    write_to_file(cgroup_path + "/cpu.max", cpu_max_value);
 
     // Add the child process to the cgroup
     write_to_file(cgroup_path + "/cgroup.procs", pid_str);
